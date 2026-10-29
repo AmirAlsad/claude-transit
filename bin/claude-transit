@@ -1,0 +1,1273 @@
+#!/bin/bash
+#
+# claude-transit: keep a MacBook awake with the lid closed while Claude Code
+# is working, then hand control back to normal sleep as soon as it's safe.
+#
+#   claude-transit [MINUTES] [--no-early] [--wait MIN]
+#                                           arm the guard (default 30 minutes)
+#   claude-transit status                   guard, sleep, lid, Claude, battery
+#   claude-transit off                      disarm now and restore sleep
+#   claude-transit log [LINES]              show the end of the log
+#   claude-transit notify-test              send a test phone notification
+#   claude-transit check [--fix]            warn (or fix) only if sleep is
+#                                           stuck off with no guard running
+#
+# While armed, a background watcher restores sleep on the first of:
+#   A  the lid is opened again after being closed
+#   B  the lid is closed and no Claude Code session has been working for
+#      GRACE seconds (sessions report in through claude-transit-hook). A
+#      session waiting on you (a permission prompt or a question) counts as
+#      working for up to --wait minutes, so you can answer from your phone.
+#   H  macOS reports critical thermal pressure
+#   C  the timeout passes
+# After B, H or C with the lid still closed, it also asks the Mac to sleep now.
+# A guardian process starts the watcher and waits on it. If the watcher dies
+# without restoring sleep (kill -9, a crash), the guardian restores it.
+#
+# While armed it also checks every 15s whether api.anthropic.com is reachable
+# and which network the Mac is on, logging each change and a summary of drops.
+#
+# When a trip ends with the lid having been closed, it logs one TRIP line:
+# what Claude did while the lid was shut (tool calls, finished turns), how
+# much CPU each running command used and whether it finished, peak heat,
+# battery used and network drops.
+#
+# It logs every change in macOS's thermal state while armed ("heat fair (was
+# nominal)"), so you can see how the Mac reacts on different trips.
+#
+# If CLAUDE_TRANSIT_NTFY or CLAUDE_TRANSIT_NOTIFY_CMD is set, it also tells
+# your phone when a session starts waiting on you with the lid closed, and
+# when it puts the Mac to sleep.
+#
+# Written for the bash 3.2 that ships with macOS.
+
+set -u
+
+VERSION="2.1.0"
+
+STATE_DIR="${CLAUDE_TRANSIT_STATE:-$HOME/.local/state/claude-transit}"
+SESS_DIR="$STATE_DIR/sessions"
+WATCHER_FILE="$STATE_DIR/watcher"
+ACT_FILE="$STATE_DIR/activity"    # hooks append here while a guard is armed
+GUARD_FILE="$STATE_DIR/guard"      # "<guardian pid> <watcher pid>"
+LOG="${CLAUDE_TRANSIT_LOG:-$HOME/Library/Logs/claude-transit.log}"
+SETTINGS="${CLAUDE_TRANSIT_SETTINGS:-$HOME/.claude/settings.json}"
+SUDOERS_FILE="${CLAUDE_TRANSIT_SUDOERS:-/etc/sudoers.d/claude-transit}"
+
+# Privileged calls use the absolute path so they match the sudoers rule exactly.
+PMSET_ABS="/usr/bin/pmset"
+
+DEFAULT_MINUTES=30
+MAX_MINUTES=240
+INTERVAL="${CLAUDE_TRANSIT_INTERVAL:-3}"   # seconds between checks
+GRACE="${CLAUDE_TRANSIT_GRACE:-30}"        # quiet seconds before vector B fires
+HEAT_EVERY="${CLAUDE_TRANSIT_HEAT_EVERY:-15}"   # seconds between thermal readings
+NET_EVERY="${CLAUDE_TRANSIT_NET_EVERY:-15}"     # seconds between network checks
+NET_URL="https://api.anthropic.com/"
+STALE_SECS=21600                           # trust a report with no known process for 6h
+WAIT_MINUTES="${CLAUDE_TRANSIT_WAIT:-10}"  # stay awake this long for a session waiting on you
+AGENT_QUIET="${CLAUDE_TRANSIT_AGENT_QUIET:-600}"  # a subagent silent this long no longer counts
+NTFY="${CLAUDE_TRANSIT_NTFY:-}"            # ntfy.sh topic (or full URL) for phone notifications
+NOTIFY_CMD="${CLAUDE_TRANSIT_NOTIFY_CMD:-}"   # or any command; gets title and message as $1 $2
+# Claude Code runs every shell command (foreground or background) as a shell
+# that first loads a saved snapshot of your shell environment, so the command
+# line contains this path. That's how background commands are recognized.
+# It's how Claude Code works today, not a documented interface: if a future
+# version changes it, override this without editing the script.
+CMD_MARKER="${CLAUDE_TRANSIT_CMD_MARKER:-/.claude/shell-snapshots/}"
+LOG_MAX_BYTES=524288
+
+ROLE="cli"
+TILDE='~'   # shown in place of $HOME in project paths
+WAIT_SECS=0 WAIT_FROM=''   # the watcher sets these: the hold for waiting sessions
+
+# ---------------------------------------------------------------- helpers
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'claude-transit: %s\n' "$*" >&2; }
+die()  { warn "$*"; exit 1; }
+now()  { date +%s; }
+
+log() {
+  printf '%s %s[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$ROLE" "$$" "$*" >> "$LOG" 2>/dev/null
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' not found. claude-transit only runs on macOS."
+}
+
+fmt_dur() {  # seconds -> "12m05s"
+  printf '%dm%02ds' $(($1 / 60)) $(($1 % 60))
+}
+
+onoff() { if [ "$1" = 1 ]; then echo on; else echo off; fi; }
+
+rotate_log() {
+  local n
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+  [ -f "$LOG" ] || return 0
+  n=$(wc -c < "$LOG" | tr -d ' ')
+  if [ "${n:-0}" -gt "$LOG_MAX_BYTES" ]; then mv -f "$LOG" "$LOG.1"; fi
+}
+
+# ---------------------------------------------------------------- machine state
+
+lid_state() {  # closed | open | unknown
+  local v
+  v=$(ioreg -r -k AppleClamshellState -d 4 2>/dev/null |
+      awk '/"AppleClamshellState"/ { print $NF; exit }')
+  case $v in
+    Yes) echo closed ;;
+    No)  echo open ;;
+    *)   echo unknown ;;
+  esac
+}
+
+sleep_disabled() {  # 1 | 0 | ? (pmset failed)
+  local out v
+  out=$(pmset -g 2>/dev/null) || { echo '?'; return 0; }
+  v=$(printf '%s\n' "$out" | awk '/SleepDisabled/ { print $2; exit }')
+  echo "${v:-0}"   # the line can be missing if it was never set
+}
+
+battery_summary() {  # e.g. "85%, discharging, 4:12 remaining"
+  local s
+  s=$(pmset -g batt 2>/dev/null | awk '
+    /InternalBattery/ {
+      d = $0
+      if (!match(d, /[0-9]+%/)) exit
+      d = substr(d, RSTART)
+      sub(/ *present:.*/, "", d)
+      n = split(d, f, ";")
+      out = ""
+      for (i = 1; i <= n; i++) {
+        x = f[i]
+        sub(/^ +/, "", x)
+        sub(/ +$/, "", x)
+        if (x == "" || x ~ /no estimate/) continue
+        out = (out == "") ? x : out ", " x
+      }
+      print out
+      exit
+    }')
+  echo "${s:-unknown (no battery reported)}"
+}
+
+pmset_priv() { sudo -n "$PMSET_ABS" "$@"; }
+
+restore_sleep() {  # succeeds once SleepDisabled reads 0
+  local i
+  for i in 1 2 3; do
+    pmset_priv -a disablesleep 0 >/dev/null 2>&1
+    [ "$(sleep_disabled)" = 0 ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+sleep_now() {
+  # Flipping disablesleep back doesn't reliably re-trigger lid-closed sleep,
+  # so ask for it explicitly. pmset sleepnow normally doesn't need root.
+  if pmset sleepnow >/dev/null 2>&1; then
+    log "sleepnow: requested"
+  else
+    log "sleepnow: refused; the Mac will sleep on its idle timer instead"
+  fi
+}
+
+notify() {
+  osascript -e "display notification \"$1\" with title \"claude-transit\"" >/dev/null 2>&1
+}
+
+push_configured() { [ -n "$NTFY$NOTIFY_CMD" ]; }
+
+# Phone notifications: an ntfy topic (or full ntfy URL), and/or any command,
+# which gets the title and message as $1 and $2. Tapping an ntfy notification
+# opens claude.ai/code, where Remote Control sessions are listed.
+push() {  # title message [priority]
+  local url ok=1
+  push_configured || return 0
+  if [ -n "$NTFY" ]; then
+    case $NTFY in *://*) url=$NTFY ;; *) url="https://ntfy.sh/$NTFY" ;; esac
+    curl -fsS -o /dev/null --connect-timeout 5 -m 8 -H "Title: $1" -H "Priority: ${3:-default}" \
+      -H "Click: https://claude.ai/code" -d "$2" "$url" >/dev/null 2>&1 || ok=0
+  fi
+  if [ -n "$NOTIFY_CMD" ]; then
+    /bin/sh -c "$NOTIFY_CMD" claude-transit "$1" "$2" </dev/null >/dev/null 2>&1 || ok=0
+  fi
+  if [ "$ok" = 1 ]; then log "phone: sent \"$1\""; else log "phone: couldn't send \"$1\""; fi
+  [ "$ok" = 1 ]
+}
+
+wait_upto() {  # pid seconds
+  local i=0
+  while proc_running "$1" && [ $i -lt $(($2 * 10)) ]; do sleep 0.1; i=$((i + 1)); done
+}
+
+# macOS's own thermal pressure reading (NSProcessInfo.thermalState), the
+# signal the system itself uses when it throttles. Needs no special permissions.
+thermal_state() {  # 0 nominal, 1 fair, 2 serious, 3 critical, ? unknown
+  local v
+  v=$(osascript -l JavaScript -e 'ObjC.import("Foundation"); $.NSProcessInfo.processInfo.thermalState' 2>/dev/null)
+  case $v in
+    0|1|2|3) echo "$v" ;;
+    *) echo '?' ;;
+  esac
+}
+
+thermal_name() {
+  case $1 in
+    0) echo nominal ;;
+    1) echo fair ;;
+    2) echo serious ;;
+    3) echo critical ;;
+    *) echo unknown ;;
+  esac
+}
+
+# Which network the Mac is on. iPhone Personal Hotspot hands out addresses
+# in 172.20.10.x, so that's recognizable without asking for the network name,
+# which recent macOS versions often hide.
+wifi_device() {
+  networksetup -listallhardwareports 2>/dev/null |
+    awk '/^Hardware Port: (Wi-Fi|AirPort)/ { f = 1; next } f && /^Device:/ { print $2; exit }'
+}
+
+wifi_label() {  # "iPhone hotspot", "Wi-Fi \"name\"", "Wi-Fi <ip>" or "no Wi-Fi"
+  local dev=${WIFI_DEV:-en0} ip ssid
+  ip=$(ipconfig getifaddr "$dev" 2>/dev/null)
+  if [ -z "$ip" ]; then echo "no Wi-Fi"; return 0; fi
+  case $ip in 172.20.10.*) echo "iPhone hotspot"; return 0 ;; esac
+  ssid=$(ipconfig getsummary "$dev" 2>/dev/null | awk -F' SSID : ' '/ SSID : / { print $2; exit }')
+  case $ssid in
+    ''|'<redacted>') echo "Wi-Fi $ip" ;;
+    *) echo "Wi-Fi \"$ssid\"" ;;
+  esac
+}
+
+# Checks in the background whether the API answers at all (any HTTP reply
+# counts), so a slow or dead network never stalls the watcher's loop.
+net_probe_start() {
+  rm -f "$NET_RESULT"
+  (
+    if curl -s -o /dev/null --connect-timeout 5 -m 8 "$NET_URL" 2>/dev/null; then r=up; else r=down; fi
+    printf '%s\n' "$r" > "$NET_RESULT.tmp" && mv -f "$NET_RESULT.tmp" "$NET_RESULT"
+  ) &
+  NET_PID=$!
+}
+
+net_record() {  # up|down epoch
+  local r=$1 t=$2 state back='' d
+  if [ "$r" = up ]; then state="$NET_LABEL, online"; else state="$NET_LABEL, api.anthropic.com unreachable"; fi
+  case "|$NET_SEEN|" in
+    *"|$NET_LABEL|"*) ;;
+    *) NET_SEEN="${NET_SEEN:+$NET_SEEN|}$NET_LABEL" ;;
+  esac
+  if [ "$r" = down ] && [ -z "$NET_DOWN_SINCE" ]; then
+    NET_DOWN_SINCE=$t
+    NET_DROPS=$((NET_DROPS + 1))
+  elif [ "$r" = up ] && [ -n "$NET_DOWN_SINCE" ]; then
+    d=$((t - NET_DOWN_SINCE))
+    NET_DOWN_TOTAL=$((NET_DOWN_TOTAL + d))
+    [ "$d" -gt "$NET_LONGEST" ] && NET_LONGEST=$d
+    NET_DOWN_SINCE=''
+    back=" | back after about $(fmt_dur "$d")"
+  fi
+  if [ "$state" != "$NET_PREV" ]; then
+    log "network: $state | lid $(lid_state) | armed $(fmt_dur $((t - START)))$back"
+    NET_PREV=$state
+  fi
+}
+
+net_summary() {
+  local t total longest d seen
+  t=$(now)
+  total=$NET_DOWN_TOTAL longest=$NET_LONGEST
+  if [ -n "$NET_DOWN_SINCE" ]; then
+    d=$((t - NET_DOWN_SINCE))
+    total=$((total + d))
+    [ "$d" -gt "$longest" ] && longest=$d
+  fi
+  seen=$(printf '%s' "$NET_SEEN" | sed 's/|/, /g')
+  if [ -z "$NET_PREV" ]; then
+    echo "network not checked"
+  elif [ "$NET_DROPS" -eq 0 ]; then
+    echo "network: no drops ($seen)"
+  else
+    echo "network: $NET_DROPS drop(s), offline about $(fmt_dur "$total") in all, longest $(fmt_dur "$longest") ($seen)"
+  fi
+}
+
+battery_pct() {
+  local b
+  b=$(battery_summary)
+  case $b in [0-9]*%*) echo "${b%%%*}%" ;; *) echo "?" ;; esac
+}
+
+# ---------------------------------------------------------------- trip summary
+
+# Called when the lid first closes: note where things stand.
+trip_start() {  # epoch
+  local cpid pid cpu rest
+  TRIP_AT=$1
+  TRIP_BATT=$(battery_pct)
+  case $PREV_HEAT_NUM in 0|1|2|3) TRIP_HEAT=$PREV_HEAT_NUM ;; esac
+  : > "$TRIP_CMDS"
+  [ -n "$CMD_LINES" ] || return 0
+  while IFS="$(printf '\t')" read -r cpid pid cpu rest; do
+    printf '%s\t%s\t%s\trunning\t%s\n' "$pid" "$cpu" "$cpu" "$(cmd_label "$rest")" >> "$TRIP_CMDS"
+  done <<EOF
+$CMD_LINES
+EOF
+}
+
+# Called on every check after that: record each command's latest CPU time,
+# add commands that started during the trip, and mark ones that ended.
+# Table lines: "<pid> <cpu at start> <cpu last seen> <status> <label>".
+trip_update() {
+  local cpid pid cpu rest
+  if [ -n "$CMD_LINES" ]; then
+    while IFS="$(printf '\t')" read -r cpid pid cpu rest; do
+      if ! awk -F'\t' -v p="$pid" '$1 == p { f = 1 } END { exit !f }' "$TRIP_CMDS" 2>/dev/null; then
+        printf '%s\t0\t%s\trunning\t%s\n' "$pid" "$cpu" "$(cmd_label "$rest")" >> "$TRIP_CMDS"
+      fi
+    done <<EOF
+$CMD_LINES
+EOF
+  fi
+  printf '%s\n' "$CMD_LINES" | awk -F'\t' -v OFS='\t' -v fin="$(date +%H:%M)" '
+    NR == FNR { if ($2 != "") cur[$2] = $3; next }
+    {
+      if ($4 == "running") { if ($1 in cur) $3 = cur[$1]; else $4 = "finished by " fin }
+      print
+    }' - "$TRIP_CMDS" > "$TRIP_CMDS.tmp" && mv -f "$TRIP_CMDS.tmp" "$TRIP_CMDS"
+}
+
+trip_summary() {
+  local closed claude cmds
+  closed=$(( $(now) - TRIP_AT ))
+  claude=$(awk -v since="$TRIP_AT" '
+    $1 >= since {
+      sess[$2] = 1
+      if ($3 == "PostToolUse") { calls++; tool[$4]++ }
+      else if ($3 == "Stop") turns++
+      else if ($3 == "SubagentStop") subs++
+    }
+    END {
+      if (calls + turns + subs == 0) { print "no activity"; exit }
+      out = (calls + 0) " tool call" (calls == 1 ? "" : "s")
+      top = ""
+      for (k = 0; k < 3; k++) {
+        best = ""
+        for (t in tool) if (!(t in used) && (best == "" || tool[t] > tool[best] || (tool[t] == tool[best] && t < best))) best = t
+        if (best == "") break
+        used[best] = 1
+        top = top (top == "" ? "" : ", ") best " " tool[best]
+      }
+      if (top != "") out = out " (" top ")"
+      n = 0; for (x in sess) n++
+      out = out ", " (turns + 0) " turn" (turns == 1 ? "" : "s") " finished"
+      if (subs) out = out ", " subs " subagent" (subs == 1 ? "" : "s") " finished"
+      print out ", " n " session" (n == 1 ? "" : "s")
+    }' "$ACT_FILE" 2>/dev/null)
+  cmds=$(awk -F'\t' '
+    {
+      d = $3 - $2; if (d < 0) d = 0
+      printf "%s%s used %dm%02ds CPU, %s", (NR > 1 ? "; " : ""), $5, int(d / 60), d % 60, ($4 == "running" ? "still running" : $4)
+    }' "$TRIP_CMDS" 2>/dev/null)
+  log "TRIP lid closed $(fmt_dur "$closed") | Claude: ${claude:-no activity} | commands: ${cmds:-none} | heat peak $(thermal_name "$TRIP_HEAT") | battery $TRIP_BATT -> $(battery_pct) | $(net_summary)"
+}
+
+hooks_installed() {
+  grep -q 'claude-transit-hook' "$SETTINGS" 2>/dev/null
+}
+
+proc_running() {  # alive and not a zombie
+  local s
+  s=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+  case $s in *Z*|'') return 1 ;; esac
+  return 0
+}
+
+# ---------------------------------------------------------------- Claude sessions
+
+session_alive() {  # pid epoch now
+  local pid=$1 ts=$2 t=$3
+  case $pid in ''|*[!0-9]*) pid=0 ;; esac
+  if [ "$pid" -gt 1 ]; then
+    # Explicit statuses throughout: in bash 4.4+, a bare "return" inside a
+    # signal handler (finish runs from one) returns the status from before
+    # the handler, not the kill's.
+    if kill -0 "$pid" 2>/dev/null; then return 0; fi
+    return 1
+  fi
+  case $ts in ''|*[!0-9]*) return 1 ;; esac
+  [ $((t - ts)) -lt "$STALE_SECS" ]
+}
+
+# Shell commands Claude Code is running right now, found by walking up from
+# each command's process to one of the given Claude processes. Also totals
+# the CPU time each command has used, counting everything it started. On
+# macOS, ps -S folds finished child processes (compiler runs and the like)
+# into their parent, so their work still counts.
+# Prints "<claude pid><TAB><command pid><TAB><cpu secs><TAB><command line>".
+scan_commands() {  # claude pids...
+  [ $# -gt 0 ] || return 0
+  # The marker goes in through the environment: on awk's command line it
+  # would match awk itself whenever Claude runs claude-transit.
+  { ps -A -S -o pid=,ppid=,time=,command= 2>/dev/null ||
+      ps -A -o pid=,ppid=,time=,command= 2>/dev/null; } |
+    CT_MARKER="$CMD_MARKER" awk -v roots=" $* " -v q="'" '
+    function secs(t,   d, n, a) {
+      d = 0
+      if (index(t, "-") > 0) { d = substr(t, 1, index(t, "-") - 1); t = substr(t, index(t, "-") + 1) }
+      n = split(t, a, ":")
+      if (n == 3) return d * 86400 + a[1] * 3600 + a[2] * 60 + a[3]
+      if (n == 2) return d * 86400 + a[1] * 60 + a[2]
+      return d * 86400 + a[1]
+    }
+    BEGIN { marker = ENVIRON["CT_MARKER"] }
+    {
+      pid = $1; pp[pid] = $2; cpu[pid] = secs($3)
+      $1 = ""; $2 = ""; $3 = ""; sub(/^ +/, "")
+      cmd[pid] = $0
+    }
+    END {
+      for (p in cmd) {
+        if (index(cmd[p], marker) == 0) continue
+        # A bare "tail -f" never ends by itself (the Monitor tool of Claude
+        # Code follows a task output with one), so it is not work. The task
+        # it follows is counted on its own.
+        i = index(cmd[p], "eval " q)
+        if (i > 0) {
+          s = substr(cmd[p], i + 6)
+          j = index(s, q " <"); if (j == 0) j = index(s, q " &&")
+          if (j > 0) s = substr(s, 1, j - 1)
+          if (s ~ /^tail[ \t]/ && s ~ /[ \t](-[A-Za-z0-9+]*[fF]|--follow)/ && s !~ /[|;&]/) continue
+        }
+        # A subshell of a command shell has the same command line; count it once.
+        if ((pp[p] in cmd) && index(cmd[pp[p]], marker) > 0 && index(roots, " " pp[p] " ") == 0) continue
+        a = pp[p]
+        for (i = 0; i < 12 && a != "" && a + 0 > 1; i++) {
+          if (index(roots, " " a " ") > 0) { shell[p] = a; break }
+          a = pp[a]
+        }
+      }
+      for (q in cmd) {
+        a = q
+        for (i = 0; i < 16 && a != "" && a + 0 > 1; i++) {
+          if (a in shell) { tree[a] += cpu[q]; break }
+          a = pp[a]
+        }
+      }
+      for (p in shell) printf "%s\t%s\t%d\t%s\n", shell[p], p, tree[p], cmd[p]
+    }'
+}
+
+# The command Claude asked for, pulled out of the wrapper shell's command
+# line. Labels end up in the log, so values that may be secrets are hidden:
+# variables set at the start ("export TOKEN=abc && npm test" shows as
+# "TOKEN=… npm test"), and any long run of letters and digits (keys, UUIDs).
+cmd_label() {
+  printf '%s\n' "$1" | awk -v q="'" -v home="$HOME" '
+    function redact(s,   out, t) {
+      out = ""
+      while (match(s, /[A-Za-z0-9_=+-]+/)) {
+        t = substr(s, RSTART, RLENGTH)
+        out = out substr(s, 1, RSTART - 1)
+        if (length(t) >= 20 && t ~ /[0-9]/) out = out "…"; else out = out t
+        s = substr(s, RSTART + RLENGTH)
+      }
+      return out s
+    }
+    {
+      s = $0
+      i = index(s, "eval " q)
+      if (i > 0) {
+        s = substr(s, i + 6)
+        j = index(s, q " <"); if (j == 0) j = index(s, q " &&")
+        if (j > 0) s = substr(s, 1, j - 1)
+      }
+      # Inside eval, a single quote shows as q "\"" q "\"" q and a newline as \012.
+      gsub(q "\"" q "\"" q, q, s)
+      gsub(/\\012/, " ", s)
+      pre = ""
+      while (match(s, /^(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/)) {
+        name = substr(s, 1, RLENGTH - 1)
+        sub(/^export[ \t]+/, "", name)
+        s = substr(s, RLENGTH + 1)
+        c = substr(s, 1, 1)
+        if (c == "\"" || c == q) {
+          j = index(substr(s, 2), c)
+          s = (j > 0) ? substr(s, j + 2) : ""
+        } else if (match(s, /^[^ \t;&]*/)) {
+          s = substr(s, RLENGTH + 1)
+        }
+        pre = pre name "=… "
+        sub(/^[ \t]*(&&|;)?[ \t]*/, "", s)
+      }
+      # A leading "cd <folder> &&" says little and uses up the label.
+      while (match(s, /^cd[ \t]+[^;&|]*&&[ \t]*/)) s = substr(s, RLENGTH + 1)
+      if (home != "") while ((i = index(s, home "/")) > 0) s = substr(s, 1, i - 1) "~" substr(s, i + length(home))
+      s = redact(pre s)
+      sub(/[ \t]+$/, "", s)
+      if (length(s) > 70) s = substr(s, 1, 67) "..."
+      print s
+    }' | iconv -c -f UTF-8 -t UTF-8 2>/dev/null   # awk cuts bytes; drop a split character
+}
+
+# Works out one session's state from its main file and any subagent files
+# ("<main file>@<agent id>"). Sets S_STATE (busy, subagent, waiting or idle),
+# S_PID, S_CWD and S_WAIT_AT (when its newest unanswered question was asked).
+# A subagent counts while its hooks keep reporting; one that has gone quiet
+# for AGENT_QUIET seconds may have been stopped without telling us.
+session_state() {  # main file, now
+  local f=$1 t=$2 st ts a a_st a_ts
+  S_STATE=idle S_PID='' S_CWD='' S_WAIT_AT=''
+  st='' ts=''
+  { read -r st S_PID ts S_CWD < "$f"; } 2>/dev/null
+  case $ts in ''|*[!0-9]*) ts=0 ;; esac
+  case $st in
+    busy) S_STATE=busy ;;
+    waiting) S_WAIT_AT=$ts ;;
+  esac
+  for a in "$f"@*; do
+    [ -f "$a" ] || continue
+    a_st='' a_ts=''
+    { read -r a_st _ a_ts _ < "$a"; } 2>/dev/null
+    case $a_ts in ''|*[!0-9]*) continue ;; esac
+    case $a_st in
+      busy)
+        if [ "$S_STATE" = idle ] && [ $((t - a_ts)) -lt "$AGENT_QUIET" ]; then S_STATE=subagent; fi ;;
+      waiting)
+        if [ -z "$S_WAIT_AT" ] || [ "$a_ts" -gt "$S_WAIT_AT" ]; then S_WAIT_AT=$a_ts; fi ;;
+    esac
+  done
+  if [ "$S_STATE" = idle ] && [ -n "$S_WAIT_AT" ]; then S_STATE=waiting; fi
+  return 0
+}
+
+# While armed, a session waiting on you keeps the Mac awake for WAIT_SECS,
+# counted from when it started waiting or when the guard was armed, if later.
+wait_left() {  # asked-at now -> sets W_LEFT (seconds; 0 when there's no hold)
+  local from=$1
+  W_LEFT=0
+  [ -n "$WAIT_FROM" ] && [ "$WAIT_SECS" -gt 0 ] || return 0
+  [ "$from" -lt "$WAIT_FROM" ] && from=$WAIT_FROM
+  W_LEFT=$((from + WAIT_SECS - $2))
+  [ "$W_LEFT" -lt 0 ] && W_LEFT=0
+  return 0
+}
+
+# Tallies sessions by the state their hooks last reported, and deletes
+# reports from sessions whose Claude process is gone. A session counts as
+# working (N_BUSY) if its turn or one of its subagents is running, or as N_BG
+# if not but a command Claude started is still running. A session waiting on
+# you counts as N_ASKING while the hold for it lasts, then as N_WAITING. Only
+# N_BUSY, N_BG and N_ASKING keep the Mac awake.
+# Sets N_BUSY, N_BG, N_ASKING, N_WAITING, N_IDLE, N_STALE, CMD_LINES,
+# BG_SUMMARY and ASKING ("<session> <asked at> <secs left> <folder>" lines).
+scan_sessions() {
+  local f st pid ts t roots='' cpid rest
+  N_BUSY=0 N_BG=0 N_ASKING=0 N_WAITING=0 N_IDLE=0 N_STALE=0 CMD_LINES='' BG_SUMMARY='' ASKING=''
+  t=$(now)
+  for f in "$SESS_DIR"/*; do
+    [ -f "$f" ] || continue
+    st='' pid='' ts=''
+    { read -r st pid ts _ < "$f"; } 2>/dev/null
+    if ! session_alive "$pid" "$ts" "$t"; then
+      N_STALE=$((N_STALE + 1))
+      rm -f "$f"
+      continue
+    fi
+    case $pid in
+      ''|0|*[!0-9]*) ;;
+      *) case "$roots " in *" $pid "*) ;; *) roots="$roots $pid" ;; esac ;;
+    esac
+  done
+
+  # shellcheck disable=SC2086  # one argument per pid
+  CMD_LINES=$(scan_commands $roots)
+  if [ -n "$CMD_LINES" ]; then
+    while IFS="$(printf '\t')" read -r cpid _ _ rest; do
+      BG_SUMMARY="${BG_SUMMARY:+$BG_SUMMARY; }$(cmd_label "$rest")"
+    done <<EOF
+$CMD_LINES
+EOF
+  fi
+
+  for f in "$SESS_DIR"/*; do
+    [ -f "$f" ] || continue
+    case ${f##*/} in *@*) continue ;; esac
+    session_state "$f" "$t"
+    if [ "$S_STATE" = busy ] || [ "$S_STATE" = subagent ]; then
+      N_BUSY=$((N_BUSY + 1))
+    elif session_has_commands "$S_PID"; then
+      N_BG=$((N_BG + 1))
+    elif [ "$S_STATE" = waiting ]; then
+      wait_left "$S_WAIT_AT" "$t"
+      if [ "$W_LEFT" -gt 0 ]; then
+        N_ASKING=$((N_ASKING + 1))
+        ASKING="$ASKING${f##*/} $S_WAIT_AT $W_LEFT $S_CWD
+"
+      else
+        N_WAITING=$((N_WAITING + 1))
+      fi
+    else
+      N_IDLE=$((N_IDLE + 1))
+    fi
+  done
+}
+
+session_has_commands() {  # claude pid (uses CMD_LINES from scan_sessions)
+  [ -n "$CMD_LINES" ] || return 1
+  printf '%s\n' "$CMD_LINES" | awk -F'\t' -v p="$1" '$1 == p { found = 1 } END { exit !found }'
+}
+
+session_commands() {  # claude pid -> one label per line
+  local cpid rest
+  [ -n "$CMD_LINES" ] || return 0
+  while IFS="$(printf '\t')" read -r cpid _ _ rest; do
+    [ "$cpid" = "$1" ] && cmd_label "$rest"
+  done <<EOF
+$CMD_LINES
+EOF
+}
+
+# One line per session, named by project folder, followed by any commands
+# Claude is running for it. Call after scan_sessions.
+list_sessions() {  # indent [pids]
+  local indent=$1 show_pid=${2:-} f st pid cwd label comm extra c t
+  t=$(now)
+  for f in "$SESS_DIR"/*; do
+    [ -f "$f" ] || continue
+    case ${f##*/} in *@*) continue ;; esac
+    session_state "$f" "$t"
+    pid=$S_PID cwd=$S_CWD
+    case $S_STATE in
+      busy) st=working ;;
+      subagent) st="working (subagent)" ;;
+      waiting) st="waiting on you" ;;
+      *) st=idle ;;
+    esac
+    if [ "$S_STATE" != busy ] && [ "$S_STATE" != subagent ] && session_has_commands "$pid"; then
+      st="running a command"
+    fi
+    label=$(project_label "$cwd" "${f##*/}")
+    extra=''
+    if [ -n "$show_pid" ]; then
+      comm=$(ps -o comm= -p "${pid:-0}" 2>/dev/null)
+      comm=${comm##*/}
+      extra="  pid ${pid:-?}${comm:+ ($comm)}"
+    fi
+    printf '%s%-30s %s%s\n' "$indent" "$label" "$st" "$extra"
+    session_commands "$pid" | while IFS= read -r c; do
+      printf '%s    $ %s\n' "$indent" "$c"
+    done
+  done
+}
+
+project_label() {  # folder [session id]
+  case $1 in
+    '') echo "session $(printf '%s' "${2:-?}" | cut -c1-8)" ;;
+    "$HOME") echo "$TILDE" ;;
+    "$HOME"/*) echo "$TILDE/${1#"$HOME"/}" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+sessions_phrase() {
+  local p=""
+  [ "$N_BUSY" -gt 0 ] && p="$N_BUSY working"
+  [ "$N_BG" -gt 0 ] && p="${p:+$p, }$N_BG running a command"
+  [ "$N_ASKING" -gt 0 ] && p="${p:+$p, }$N_ASKING waiting on you"
+  if [ "$N_WAITING" -gt 0 ]; then
+    if [ -n "$WAIT_FROM" ] && [ "$WAIT_SECS" -gt 0 ]; then
+      p="${p:+$p, }$N_WAITING still waiting on you after $(fmt_dur "$WAIT_SECS")"
+    else
+      p="${p:+$p, }$N_WAITING waiting on you"
+    fi
+  fi
+  [ "$N_IDLE" -gt 0 ] && p="${p:+$p, }$N_IDLE idle"
+  echo "${p:-no sessions reporting}"
+}
+
+# ---------------------------------------------------------------- watcher file
+
+# One line: "<pid> <start epoch> <timeout secs> <early 0|1> <status> <wait secs>"
+write_watcher() {
+  printf '%s %s %s %s %s %s\n' "$$" "$1" "$2" "$3" "$4" "$WAIT_SECS" > "$WATCHER_FILE.$$" &&
+    mv -f "$WATCHER_FILE.$$" "$WATCHER_FILE"
+}
+
+read_watcher() {  # sets W_PID W_START W_TIMEOUT W_EARLY W_STATUS W_WAIT
+  W_PID='' W_START='' W_TIMEOUT='' W_EARLY='' W_STATUS='' W_WAIT=''
+  [ -f "$WATCHER_FILE" ] || return 1
+  { read -r W_PID W_START W_TIMEOUT W_EARLY W_STATUS W_WAIT _ < "$WATCHER_FILE"; } 2>/dev/null
+  case $W_PID in ''|*[!0-9]*) return 1 ;; esac
+  return 0
+}
+
+watcher_alive() {
+  read_watcher || return 1
+  proc_running "$W_PID" || return 1
+  ps -p "$W_PID" -o command= 2>/dev/null | grep -q 'claude-transit.* _watch'
+}
+
+stop_watcher() {  # pid
+  local i=0
+  kill -TERM "$1" 2>/dev/null
+  while proc_running "$1" && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  if proc_running "$1"; then
+    kill -KILL "$1" 2>/dev/null
+    sleep 0.2
+  fi
+  ! proc_running "$1"
+}
+
+# ---------------------------------------------------------------- the guardian
+
+read_guard() {  # sets G_PID G_CHILD
+  G_PID='' G_CHILD=''
+  { read -r G_PID G_CHILD < "$GUARD_FILE"; } 2>/dev/null
+  case $G_PID in ''|*[!0-9]*) return 1 ;; esac
+  return 0
+}
+
+guardian_alive() {
+  read_guard || return 1
+  proc_running "$G_PID" || return 1
+  ps -p "$G_PID" -o command= 2>/dev/null | grep -q 'claude-transit.* _guard'
+}
+
+# Stop the guardian before its watcher, so it doesn't mistake a deliberate
+# stop (or a replacement arming) for the watcher dying.
+stop_guardian() {
+  local i=0
+  if guardian_alive; then
+    kill -TERM "$G_PID" 2>/dev/null
+    while proc_running "$G_PID" && [ $i -lt 20 ]; do sleep 0.1; i=$((i + 1)); done
+  fi
+  rm -f "$GUARD_FILE"
+}
+
+# SIGKILL can't be caught, so the watcher can't clean up after kill -9. This
+# separate process waits for it to exit and restores sleep if it's still off.
+guard_main() {  # timeout_secs early
+  local wpid rc how
+  ROLE="guard"
+  trap '' HUP
+  trap 'exit 0' TERM   # claude-transit off, or a new arm replacing this one
+
+  "$BASH" "$0" _watch "$@" &
+  wpid=$!
+  printf '%s %s\n' "$$" "$wpid" > "$GUARD_FILE.$$" && mv -f "$GUARD_FILE.$$" "$GUARD_FILE"
+
+  wait "$wpid"
+  rc=$?
+
+  if read_guard && [ "$G_PID" = "$$" ]; then rm -f "$GUARD_FILE"; fi
+  [ "$(sleep_disabled)" = 1 ] || return 0
+  # Leave it alone if a newer watcher now owns the setting.
+  if watcher_alive && [ "$W_PID" != "$wpid" ]; then return 0; fi
+
+  if [ "$rc" -gt 128 ]; then how="killed by signal $((rc - 128))"; else how="exit $rc"; fi
+  if restore_sleep; then
+    log "GUARDIAN: watcher (pid $wpid) ended ($how) with sleep still off; restored sleep"
+    if [ "$(lid_state)" = closed ]; then sleep_now; fi
+  else
+    log "GUARDIAN: watcher (pid $wpid) ended ($how) with sleep off, and restoring it failed. Run: claude-transit off"
+    notify "Sleep is off and couldn't be turned back on. Run: claude-transit off"
+  fi
+  if read_watcher && [ "$W_PID" = "$wpid" ]; then rm -f "$WATCHER_FILE"; fi
+}
+
+remove_watcher_file() {  # only if it's ours; a replacement may own it now
+  local pid=''
+  { read -r pid _ < "$WATCHER_FILE"; } 2>/dev/null
+  [ "$pid" = "$$" ] && rm -f "$WATCHER_FILE"
+}
+
+# ---------------------------------------------------------------- the watcher
+
+finish() {  # code reason
+  local code=$1 reason=$2 lid restored=yes msg
+  [ "$DONE" = 1 ] && return 0
+  DONE=1
+  [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
+  [ -n "$NET_PID" ] && kill "$NET_PID" 2>/dev/null
+  rm -f "$NET_RESULT" "$NET_RESULT.tmp"
+  lid=$(lid_state)
+  # Tell the phone while sleep is still off: once it's back on, the Mac may
+  # go to sleep before the message is out.
+  if [ "$lid" = closed ] && push_configured; then
+    case $code in
+      B) if [ "$N_WAITING" -gt 0 ]; then
+           msg="No answer came, so the Mac is going to sleep. The waiting session picks up when you open the lid."
+         else
+           msg="Claude finished, so the Mac is going to sleep."
+         fi ;;
+      C) msg="Time's up, so the Mac is going to sleep." ;;
+      H) msg="The Mac reached critical heat, so it's going to sleep." ;;
+      *) msg='' ;;
+    esac
+    if [ -n "$msg" ]; then
+      push "Mac going to sleep" "$msg" &
+      wait_upto $! 10
+    fi
+  fi
+  if restore_sleep; then ARMED=0; else restored=no; fi
+  lid=$(lid_state)
+  log "DISARMED [$code] $reason | armed $(fmt_dur $(( $(now) - START ))) | lid $lid | heat $(thermal_name "$(thermal_state)") | battery $(battery_summary) | $(net_summary) | SleepDisabled $(sleep_disabled)"
+  if [ -n "$TRIP_AT" ]; then
+    scan_sessions
+    trip_update
+    trip_summary
+  fi
+  rm -f "$ACT_FILE" "$TRIP_CMDS" "$TRIP_CMDS.tmp"
+  if [ "$restored" = no ]; then
+    log "ERROR: couldn't restore sleep. Run: claude-transit off"
+    notify "Couldn't turn sleep back on. Run: claude-transit off"
+  fi
+  case $code in
+    A) notify "Lid reopened. Normal sleep restored." ;;
+    B|C) [ "$lid" = closed ] && sleep_now ;;
+    H)
+      if [ "$lid" = closed ]; then
+        sleep_now
+      else
+        notify "The Mac reached critical heat, so normal sleep is back on."
+      fi ;;
+  esac
+  remove_watcher_file
+  exit 0
+}
+
+on_exit() {
+  if [ "$ARMED" = 1 ]; then
+    if restore_sleep; then
+      ARMED=0
+      log "watcher exited while armed; sleep restored"
+    else
+      log "ERROR: watcher exited while armed and couldn't restore sleep. Run: claude-transit off"
+    fi
+  fi
+  [ "$DONE" = 1 ] || [ "${W_FAILED:-0}" = 1 ] || remove_watcher_file
+  rm -f "$ACT_FILE" "$TRIP_CMDS" "$TRIP_CMDS.tmp"
+}
+
+watch_main() {  # timeout_secs early wait_secs
+  local timeout_secs=$1 early=$2
+  local t lid prev_lid='' idle_since='' prev_sessions='' has_closed=0 cur
+  local heat prev_heat='' last_heat=0 prev_bg='' last_net=0 r slow='' told=''
+  local a_sid a_at a_left a_cwd msg
+  ROLE="watch"
+  ARMED=0 DONE=0 SLEEP_PID='' W_FAILED=0
+  START=$(now)
+  WAIT_SECS=${3:-0} WAIT_FROM=$START
+  NET_PID='' NET_RESULT="$STATE_DIR/net.$$" NET_LABEL='' NET_PREV='' NET_SEEN=''
+  NET_DOWN_SINCE='' NET_DROPS=0 NET_DOWN_TOTAL=0 NET_LONGEST=0
+  WIFI_DEV=$(wifi_device)
+  TRIP_AT='' TRIP_BATT='' TRIP_HEAT='' PREV_HEAT_NUM='' TRIP_CMDS="$STATE_DIR/trip.$$"
+
+  # A closing terminal sends SIGHUP; that must not disarm the guard.
+  trap '' HUP
+  trap 'finish S "stopped by SIGTERM"' TERM
+  trap 'finish S "interrupted by SIGINT"' INT
+  trap on_exit EXIT
+
+  mkdir -p "$SESS_DIR"
+  : > "$ACT_FILE"
+  write_watcher "$START" "$timeout_secs" "$early" starting
+
+  ARMED=1
+  if ! pmset_priv -a disablesleep 1 >/dev/null 2>&1; then
+    ARMED=0 W_FAILED=1
+    write_watcher "$START" "$timeout_secs" "$early" failed
+    log "ARM FAILED: 'sudo -n $PMSET_ABS -a disablesleep 1' was refused. Is the sudoers rule installed? (run install.sh)"
+    exit 1
+  fi
+  # Normally under a second. If it took long, the lid may have been closed
+  # (and the Mac asleep) before sleep was turned off.
+  t=$(now)
+  [ $((t - START)) -gt 5 ] && slow=" | arming took $(fmt_dur $((t - START)))"
+  scan_sessions
+  prev_sessions=$(sessions_phrase)
+  prev_bg=$BG_SUMMARY
+  log "ARMED for $((timeout_secs / 60)) min$slow | early finish $(onoff "$early") (grace ${GRACE}s, waits $(fmt_dur "$WAIT_SECS") for answers) | phone $(if push_configured; then echo on; else echo off; fi) | lid $(lid_state) | claude: $prev_sessions | commands running: ${BG_SUMMARY:-none} | heat $(thermal_name "$(thermal_state)") | battery $(battery_summary) | network $(wifi_label)"
+  # Only now tell the arming command it worked, so the ARMED line is already logged.
+  write_watcher "$START" "$timeout_secs" "$early" armed
+
+  while :; do
+    t=$(now)
+    if [ $((t - START)) -ge "$timeout_secs" ]; then
+      finish C "timeout: $(fmt_dur "$timeout_secs") passed"
+    fi
+
+    if [ -n "$NET_PID" ] && [ -f "$NET_RESULT" ]; then
+      r=$(cat "$NET_RESULT" 2>/dev/null)
+      rm -f "$NET_RESULT"
+      NET_PID=''
+      net_record "$r" "$t"
+    fi
+    if [ -z "$NET_PID" ] && [ $((t - last_net)) -ge "$NET_EVERY" ]; then
+      last_net=$t
+      NET_LABEL=$(wifi_label)
+      net_probe_start
+    fi
+
+    if [ $((t - last_heat)) -ge "$HEAT_EVERY" ]; then
+      last_heat=$t
+      heat=$(thermal_state)
+      case $heat in
+        0|1|2|3)
+          PREV_HEAT_NUM=$heat
+          if [ -n "$TRIP_AT" ] && { [ -z "$TRIP_HEAT" ] || [ "$heat" -gt "$TRIP_HEAT" ]; }; then TRIP_HEAT=$heat; fi ;;
+      esac
+      if [ -n "$prev_heat" ] && [ "$heat" != "$prev_heat" ]; then
+        log "heat $(thermal_name "$heat") (was $(thermal_name "$prev_heat")) | lid $(lid_state) | armed $(fmt_dur $((t - START)))"
+      fi
+      prev_heat=$heat
+      [ "$heat" = 3 ] && finish H "heat: macOS reports critical thermal pressure"
+    fi
+
+    lid=$(lid_state)
+    if [ "$lid" != "$prev_lid" ]; then
+      log "lid $lid"
+      prev_lid=$lid
+    fi
+
+    # Sessions are scanned even with --no-early, for the log and the trip summary.
+    scan_sessions
+    cur=$(sessions_phrase)
+    if [ "$cur" != "$prev_sessions" ]; then
+      log "claude: $cur"
+      prev_sessions=$cur
+    fi
+    if [ "$BG_SUMMARY" != "$prev_bg" ]; then
+      log "commands running: ${BG_SUMMARY:-none}"
+      prev_bg=$BG_SUMMARY
+    fi
+    if [ -z "$TRIP_AT" ] && [ "$lid" = closed ]; then
+      trip_start "$t"
+    elif [ -n "$TRIP_AT" ]; then
+      trip_update
+    fi
+
+    # Each question gets one log line and one phone notification, once the
+    # lid is closed. "told" holds "<session>:<asked at>" for each.
+    if [ -n "$ASKING" ] && [ "$lid" = closed ]; then
+      while read -r a_sid a_at a_left a_cwd; do
+        [ -n "$a_sid" ] || continue
+        case " $told " in *" $a_sid:$a_at "*) continue ;; esac
+        told="$told $a_sid:$a_at"
+        log "$(project_label "$a_cwd" "$a_sid") is waiting on you; staying awake up to $(fmt_dur "$a_left") for an answer"
+        msg="$(project_label "$a_cwd" "$a_sid" | sed 's|.*/||') needs an answer."
+        # With --no-early only the lid and the timer end the trip.
+        [ "$early" = 1 ] && msg="$msg The Mac stays awake about $(( (a_left + 59) / 60 )) more min for it."
+        push "Claude is waiting on you" "$msg" high &
+      done <<EOF
+$ASKING
+EOF
+    fi
+
+    case $lid in
+      closed)
+        has_closed=1
+        if [ "$early" = 1 ]; then
+          if [ $((N_BUSY + N_BG + N_ASKING)) -eq 0 ]; then
+            if [ -z "$idle_since" ]; then
+              idle_since=$t
+              log "no Claude session working; restoring sleep in ${GRACE}s unless one starts"
+            fi
+            if [ $((t - idle_since)) -ge "$GRACE" ]; then
+              finish B "Claude finished: no session working for ${GRACE}s with the lid closed"
+            fi
+          elif [ -n "$idle_since" ]; then
+            idle_since=''
+            log "a Claude session is working again; staying awake"
+          fi
+        fi
+        ;;
+      open)
+        idle_since=''
+        [ "$has_closed" = 1 ] && finish A "lid reopened"
+        ;;
+    esac
+
+    # Sleep in the background and wait, so signals are handled right away.
+    sleep "$INTERVAL" &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null
+    SLEEP_PID=''
+  done
+}
+
+# ---------------------------------------------------------------- commands
+
+usage() {
+  cat <<EOF
+claude-transit $VERSION: keep the Mac awake with the lid closed while Claude Code works.
+
+  claude-transit [MINUTES] [--no-early] [--wait MIN]
+                                          arm (default $DEFAULT_MINUTES min, max $MAX_MINUTES)
+  claude-transit status                   show guard, sleep, lid, Claude and battery state
+  claude-transit off                      disarm now and restore normal sleep
+  claude-transit log [LINES]              show the end of the log
+  claude-transit notify-test              send a test notification to your phone
+  claude-transit check [--fix]            warn (or fix) only if sleep is stuck off
+
+The guard restores sleep when you open the lid, when every Claude session has
+stopped working for ${GRACE}s with the lid closed, when the Mac reports critical
+heat, or when the time is up, whichever comes first. Heat changes are logged.
+--no-early turns off the "Claude stopped working" check for this trip.
+--wait MIN: a session waiting on you (a permission prompt or a question)
+counts as working for up to MIN minutes, so you can answer it from your
+phone (default $WAIT_MINUTES, from CLAUDE_TRANSIT_WAIT; 0 turns it off).
+
+Phone notifications: set CLAUDE_TRANSIT_NTFY to an ntfy.sh topic, or
+CLAUDE_TRANSIT_NOTIFY_CMD to a command (it gets the title and message as \$1 \$2).
+
+Log: $LOG
+EOF
+}
+
+cmd_arm() {
+  local minutes=$DEFAULT_MINUTES early=1 wait_min=$WAIT_MINUTES secs wait_secs self gpid wpid i status note=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --no-early) early=0 ;;
+      --wait) [ $# -ge 2 ] || die "--wait needs a number of minutes"; wait_min=$2; shift ;;
+      --wait=*) wait_min=${1#--wait=} ;;
+      -h|--help) usage; return 0 ;;
+      ''|*[!0-9]*) die "unknown argument '$1' (see claude-transit --help)" ;;
+      *) minutes=$((10#$1)) ;;
+    esac
+    shift
+  done
+  if [ "$minutes" -lt 1 ] || [ "$minutes" -gt "$MAX_MINUTES" ]; then
+    die "minutes must be between 1 and $MAX_MINUTES"
+  fi
+  case $wait_min in ''|*[!0-9]*) die "--wait (or CLAUDE_TRANSIT_WAIT) takes whole minutes, 0 to turn it off" ;; esac
+  secs=$((minutes * 60))
+  wait_secs=$((10#$wait_min * 60))
+  [ -n "${CLAUDE_TRANSIT_TIMEOUT_SECS:-}" ] && secs=$CLAUDE_TRANSIT_TIMEOUT_SECS   # for tests
+  [ -n "${CLAUDE_TRANSIT_WAIT_SECS:-}" ] && wait_secs=$CLAUDE_TRANSIT_WAIT_SECS     # for tests
+
+  need pmset
+  need ioreg
+  mkdir -p "$SESS_DIR" || die "can't create $SESS_DIR"
+  rotate_log
+
+  if [ "$(lid_state)" = unknown ]; then
+    warn "couldn't read the lid state, so opening the lid won't disarm the guard. The timeout still applies."
+  fi
+
+  if [ "$early" = 1 ] && ! hooks_installed; then
+    early=0
+    note="Early finish is off: the Claude Code hooks aren't in $SETTINGS. Run install.sh to add them."
+  fi
+
+  stop_guardian
+  if watcher_alive; then
+    log "replacing the running guard (pid $W_PID)"
+    stop_watcher "$W_PID" || die "couldn't stop the running guard (pid $W_PID)"
+  fi
+  rm -f "$WATCHER_FILE"   # nothing is running now; anything left is stale
+
+  self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  # Start the guardian, which starts the watcher. Detach fully: new session
+  # (so nothing that kills our process group takes them with it), no terminal
+  # on any file descriptor.
+  if command -v perl >/dev/null 2>&1; then
+    # shellcheck disable=SC2016  # $ARGV is Perl, not shell
+    nohup perl -MPOSIX -e 'POSIX::setsid(); exec { $ARGV[0] } @ARGV or exit 127' \
+      "$BASH" "$self" _guard "$secs" "$early" "$wait_secs" </dev/null >>"$LOG" 2>&1 &
+  else
+    nohup "$BASH" "$self" _guard "$secs" "$early" "$wait_secs" </dev/null >>"$LOG" 2>&1 &
+  fi
+  gpid=$!
+
+  status='' wpid=''
+  i=0
+  while [ $i -lt 50 ]; do
+    if [ -z "$wpid" ] && read_guard && [ "$G_PID" = "$gpid" ]; then wpid=$G_CHILD; fi
+    if [ -n "$wpid" ] && read_watcher && [ "$W_PID" = "$wpid" ]; then
+      case $W_STATUS in armed|failed) status=$W_STATUS; break ;; esac
+    fi
+    if ! proc_running "$gpid"; then
+      # The guardian exits as soon as a failed watcher does.
+      if read_watcher && [ "$W_STATUS" = failed ]; then status=failed; else status=died; fi
+      break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  case $status in
+    armed) ;;
+    failed)
+      warn "couldn't disable sleep: sudo wants a password for pmset. Run install.sh to add the sudoers rule."
+      exit 1 ;;
+    died)
+      warn "the watcher exited during startup. Last log lines:"
+      tail -n 5 "$LOG" >&2
+      exit 1 ;;
+    *)
+      warn "the watcher (pid ${wpid:-?}) hasn't confirmed yet, so sleep may still be on."
+      warn "Keep the lid open until 'claude-transit status' says armed."
+      exit 1 ;;
+  esac
+
+  scan_sessions
+  say "Guard armed for $minutes min (pid $wpid). Sleep stays off until the first of:"
+  say "  - you open the lid"
+  if [ "$early" = 1 ]; then
+    say "  - every Claude session has stopped working for ${GRACE}s with the lid closed"
+    say "    (a command Claude is still running, even in the background, counts as working)"
+    if [ "$wait_secs" -gt 0 ]; then
+      say "    (a session waiting on you counts as working for up to $(fmt_dur "$wait_secs"), so you can answer from your phone)"
+    fi
+  fi
+  say "  - the Mac reports critical heat"
+  say "  - $minutes min pass"
+  say ""
+  say "Claude: $(sessions_phrase)"
+  list_sessions "  "
+  [ -n "$note" ] && say "$note"
+  if [ "$early" = 1 ] && [ "$N_WAITING" -gt 0 ]; then
+    if [ "$wait_secs" -gt 0 ]; then
+      say "Note: a session above is waiting on you (a permission prompt?). It keeps the Mac awake for"
+      say "      up to $(fmt_dur "$wait_secs") from now. Answer it now, or from your phone with Remote Control."
+    else
+      say "Note: a session above is waiting on you (a permission prompt?). Waiting sessions don't keep"
+      say "      the Mac awake, so answer it now if you want it to keep working during the trip."
+    fi
+  fi
+  if [ "$early" = 1 ] && [ -n "$CMD_LINES" ]; then
+    say "Note: the commands marked \$ above keep the Mac awake until they finish. One that never"
+    say "      exits (a dev server, a file watcher) keeps it awake until you open the lid or"
+    say "      $minutes min pass."
+  fi
+  if [ "$early" = 1 ] && [ $((N_BUSY + N_BG)) -eq 0 ]; then
+    say "Note: no Claude session is working right now, so ${GRACE}s after the lid closes the Mac"
+    say "      will sleep. Start the task first, or rerun with --no-early."
+  fi
+  say ""
+  say "Before you close the lid:"
+  say "  - Battery: $(battery_summary). Make sure that covers the trip."
+  say "  - Heat: carry it in the open or in a roomy bag compartment. Never a sleeve, padded laptop"
+  say "    pocket or packed bag: with the lid shut, the case is how the heat gets out."
+  say "  - Network: join your hotspot now. Claude Code rides out short drops on its own."
+  if push_configured; then
+    say "  - Phone: you'll get a notification if a session needs an answer, and when the Mac sleeps."
+  fi
+  return 0
+}
+
+cmd_status() {
+  local left sd
+  if watcher_alive; then
+    left=$((W_START + W_TIMEOUT - $(now)))
+    [ "$left" -lt 0 ] && left=0
+    say "Guard:     armed (pid $W_PID), $(fmt_dur "$left") left, early finish $(onoff "$W_EARLY"), waits $(fmt_dur "${W_WAIT:-0}") for answers"
+    if guardian_alive; then
+      say "Guardian:  pid $G_PID"
+    else
+      say "Guardian:  not running (sleep won't be restored if the watcher is killed)"
+    fi
+  else
+    say "Guard:     not running"
+  fi
+  sd=$(sleep_disabled)
+  case $sd in
+    1) say "Sleep:     OFF (SleepDisabled 1)" ;;
+    0) say "Sleep:     normal (SleepDisabled 0)" ;;
+    *) say "Sleep:     unknown" ;;
+  esac
+  say "Lid:       $(lid_state)"
+  scan_sessions
+  say "Claude:    $(sessions_phrase)"
+  list_sessions "             " pids
+  say "Battery:   $(battery_summary)"
+  if hooks_installed; then say "Hooks:     installed"; else say "Hooks:     missing from $SETTINGS"; fi
+  if [ -e "$SUDOERS_FILE" ]; then say "Sudo rule: installed"; else say "Sudo rule: missing ($SUDOERS_FILE)"; fi
+  say "Phone:     $(phone_summary)"
+  say "Log:       $LOG"
+  if [ "$sd" = 1 ] && ! watcher_alive; then
+    say ""
+    say "Sleep is off but no guard is running. Run: claude-transit off"
+  fi
+}
+
+cmd_off() {
+  stop_guardian
+  if watcher_alive; then
+    log "off requested; stopping the guard (pid $W_PID)"
+    stop_watcher "$W_PID" || warn "couldn't stop the guard (pid $W_PID)"
+  fi
+  if [ "$(sleep_disabled)" = 1 ]; then
+    restore_sleep || die "couldn't restore sleep. Try: sudo pmset -a disablesleep 0"
+    log "off: restored sleep directly (no guard was holding it)"
+  fi
+  say "Normal sleep restored (SleepDisabled $(sleep_disabled))."
+}
+
+# Sleep can be left off if the watcher is killed with -9, or if the Mac shuts
+# down while armed (the setting persists). "check" warns (for ~/.zshrc);
+# "check --fix" restores it (the login agent install.sh adds runs this).
+cmd_check() {
+  local fix=0
+  [ "${1:-}" = --fix ] && fix=1
+  [ "$(sleep_disabled)" = 1 ] || return 0
+  watcher_alive && return 0
+  if [ "$fix" = 0 ]; then
+    warn "sleep is disabled but no guard is running. Run: claude-transit off"
+    return 0
+  fi
+  if restore_sleep; then
+    log "check --fix: sleep was off with no guard running; restored it"
+    notify "Sleep had been left off. claude-transit turned it back on."
+  else
+    log "check --fix: sleep is off with no guard running, and restoring it failed"
+    notify "Sleep is off and couldn't be turned back on. Run: claude-transit off"
+  fi
+  return 0
+}
+
+phone_summary() {
+  local p=''
+  [ -n "$NTFY" ] && p="ntfy ($NTFY)"
+  [ -n "$NOTIFY_CMD" ] && p="${p:+$p and }command (CLAUDE_TRANSIT_NOTIFY_CMD)"
+  echo "${p:-off (set CLAUDE_TRANSIT_NTFY or CLAUDE_TRANSIT_NOTIFY_CMD)}"
+}
+
+cmd_notify_test() {
+  push_configured || die "phone notifications are off. Set CLAUDE_TRANSIT_NTFY to an ntfy.sh topic (or CLAUDE_TRANSIT_NOTIFY_CMD)."
+  rotate_log
+  if push "claude-transit test" "Phone notifications work. You'll get one when a session waits on you with the lid closed."; then
+    say "Sent to $(phone_summary)."
+  else
+    die "sending failed. See: claude-transit log"
+  fi
+}
+
+cmd_log() {
+  local n=${1:-40}
+  case $n in ''|*[!0-9]*) die "usage: claude-transit log [LINES]" ;; esac
+  [ -f "$LOG" ] || { say "No log yet ($LOG)."; return 0; }
+  tail -n "$n" "$LOG"
+}
+
+case "${1:-}" in
+  status)       cmd_status ;;
+  off|stop)     cmd_off ;;
+  log|logs)     shift; cmd_log "$@" ;;
+  check)        shift; cmd_check "$@" ;;
+  notify-test)  cmd_notify_test ;;
+  _watch)       shift; watch_main "$@" ;;
+  _guard)       shift; guard_main "$@" ;;
+  help|-h|--help) usage ;;
+  version|--version) say "$VERSION" ;;
+  *)            cmd_arm "$@" ;;
+esac

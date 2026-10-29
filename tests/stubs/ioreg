@@ -1,0 +1,5 @@
+#!/bin/bash
+# Test stub for ioreg: reports $STUB_STATE/lid (Yes = closed, No = open).
+S=${STUB_STATE:?STUB_STATE not set}
+printf '+-o IOPMrootDomain  <class IOPMrootDomain>\n  {\n    "AppleClamshellCausesSleep" = Yes\n    "AppleClamshellState" = %s\n  }\n' \
+  "$(cat "$S/lid" 2>/dev/null || echo No)"

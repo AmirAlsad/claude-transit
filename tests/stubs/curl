@@ -1,0 +1,7 @@
+#!/bin/bash
+# Test stub for curl: the API answers unless $STUB_STATE/net says "down".
+# Phone notifications (requests with -d) are recorded as "push <args>".
+S=${STUB_STATE:?STUB_STATE not set}
+for a; do [ "$a" = -d ] && echo "push $*" >> "$S/events"; done
+[ "$(cat "$S/net" 2>/dev/null)" = down ] && exit 28
+exit 0

@@ -1,0 +1,3 @@
+#!/bin/bash
+# Test stub for networksetup: Wi-Fi is en0.
+printf 'Hardware Port: Thunderbolt Bridge\nDevice: bridge0\n\nHardware Port: Wi-Fi\nDevice: en0\nEthernet Address: aa:bb\n'

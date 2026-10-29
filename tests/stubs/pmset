@@ -1,0 +1,21 @@
+#!/bin/bash
+# Test stub for macOS pmset. State lives in $STUB_STATE.
+S=${STUB_STATE:?STUB_STATE not set}
+case "$*" in
+  "-g")
+    v=$(cat "$S/sleepdisabled" 2>/dev/null || echo 0)
+    if [ "$v" = missing ]; then   # never set: no SleepDisabled line at all
+      printf 'System-wide power settings:\nCurrently in use:\n standby              1\n'
+    else
+      printf 'System-wide power settings:\n SleepDisabled\t\t%s\nCurrently in use:\n standby              1\n' "$v"
+    fi ;;
+  "-g batt")
+    printf "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=4653155)\t%s present: true\n" \
+      "$(cat "$S/batt" 2>/dev/null || echo '85%; discharging; 4:12 remaining')" ;;
+  "-a disablesleep 0"|"-a disablesleep 1")
+    [ "${STUB_ROOT:-}" = 1 ] || { echo "pmset: this command requires root" >&2; exit 1; }
+    echo "${3}" > "$S/sleepdisabled" ;;
+  "sleepnow")
+    echo "sleepnow" >> "$S/events"; echo "Sleeping now..." ;;
+  *) echo "pmset stub: unhandled: $*" >&2; exit 1 ;;
+esac

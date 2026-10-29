@@ -1,0 +1,125 @@
+#!/bin/bash
+#
+# claude-transit-hook: tells claude-transit what a Claude Code session is doing.
+# install.sh registers it in ~/.claude/settings.json:
+#
+#   UserPromptSubmit                    -> prompt  (working)
+#   PreToolUse, PostToolUse             -> tool    (working, e.g. Claude carried
+#                                                   on without a new prompt)
+#   Stop                                -> stop    (turn finished)
+#   SubagentStart, SubagentStop         -> substart, subend (a subagent began
+#                                                   or ended)
+#   Notification: idle_prompt           -> idle    (turn finished, or ended
+#                                                   without Stop, e.g. interrupted)
+#   Notification: permission_prompt,
+#     elicitation_dialog                -> wait    (asking you something)
+#   SessionEnd                          -> end     (forget the session)
+#
+# Each session gets one file named after its session_id, holding
+# "<state> <Claude Code pid> <epoch seconds> <project folder>". Events from
+# a subagent carry its agent_id and go to a second file, "<session>@<agent>",
+# so a background subagent still counts as working after the main turn ends.
+#
+# This script must stay silent, because stdout from a UserPromptSubmit hook
+# becomes context for Claude. It must also always exit 0, because exit 2 from
+# a Stop hook would keep Claude from stopping.
+
+exec >/dev/null 2>&1
+
+state_dir="${CLAUDE_TRANSIT_STATE:-$HOME/.local/state/claude-transit}"
+dir="$state_dir/sessions"
+event=${1:-}
+input=$(cat)
+
+re='"session_id"[[:space:]]*:[[:space:]]*"([A-Za-z0-9_-]+)"'
+[[ $input =~ $re ]] || exit 0
+sid=${BASH_REMATCH[1]}
+file="$dir/$sid"
+cwd=''
+re_cwd='"cwd"[[:space:]]*:[[:space:]]*"([^"]*)"'
+[[ $input =~ $re_cwd ]] && cwd=${BASH_REMATCH[1]}
+
+# agent_id comes before hook_event_name; only look there, so an "agent_id"
+# inside a tool's input can't be mistaken for it.
+aid=''
+head=${input%%\"hook_event_name\"*}
+re_aid='"agent_id"[[:space:]]*:[[:space:]]*"([A-Za-z0-9_-]+)"'
+[[ $head =~ $re_aid ]] && aid=${BASH_REMATCH[1]}
+
+# While a guard is armed, note each event for its trip summary:
+# "<epoch> <session> <hook event> <tool>".
+if [ -f "$state_dir/activity" ]; then
+  ev=$event tool=-
+  re_ev='"hook_event_name"[[:space:]]*:[[:space:]]*"([A-Za-z]+)"'
+  [[ $input =~ $re_ev ]] && ev=${BASH_REMATCH[1]}
+  re_tool='"tool_name"[[:space:]]*:[[:space:]]*"([A-Za-z0-9_.:-]+)"'
+  [[ $input =~ $re_tool ]] && tool=${BASH_REMATCH[1]}
+  printf '%s %s %s %s\n' "$(date +%s)" "$sid" "$ev" "$tool" >> "$state_dir/activity"
+fi
+
+case $event in
+  prompt|tool|substart) state=busy ;;
+  stop|idle)   state=idle ;;
+  wait)        state=waiting ;;
+  subend)      [ -n "$aid" ] && rm -f "$file@$aid"; exit 0 ;;
+  end)         rm -f "$file" "$file"@*; exit 0 ;;
+  *)           exit 0 ;;
+esac
+
+main_file=$file
+[ -n "$aid" ] && file="$file@$aid"
+
+old_state='' old_pid='' old_ts='' old_cwd=''
+[ -f "$file" ] && read -r old_state old_pid old_ts old_cwd < "$file"
+
+# PreToolUse and PostToolUse fire on every tool call. When nothing changed,
+# skip the write. A subagent's file is still rewritten once a minute, because
+# claude-transit stops counting a subagent that has gone quiet for too long
+# (it may have been stopped without SubagentStop).
+if [ "$event" = tool ] && [ "$old_state" = busy ] && [ "${old_pid:-0}" != 0 ]; then
+  [ -z "$aid" ] && exit 0
+  case $old_ts in ''|*[!0-9]*) ;; *) [ $(( $(date +%s) - old_ts )) -lt 60 ] && exit 0 ;; esac
+fi
+
+# idle_prompt can also fire while a permission prompt sits unanswered. Keep
+# "waiting" then, so status shows the session is blocked on you.
+if [ "$event" = idle ] && [ "$old_state" = waiting ]; then
+  exit 0
+fi
+
+# The Claude Code process is the first ancestor that isn't a shell. Recording
+# it lets claude-transit ignore reports from sessions that have since died.
+claude_pid() {
+  local pid=$PPID ppid comm i=0
+  while [ $i -lt 5 ]; do
+    case $pid in ''|0|1|*[!0-9]*) break ;; esac
+    read -r ppid comm <<< "$(ps -o ppid= -o comm= -p "$pid" 2>/dev/null)"
+    comm=${comm##*/}
+    comm=${comm#-}
+    case $comm in
+      '') break ;;
+      sh|bash|zsh|dash|ksh|fish) pid=$ppid ;;
+      *) echo "$pid"; return 0 ;;
+    esac
+    i=$((i + 1))
+  done
+  echo 0
+}
+
+pid=$old_pid
+if [ "$event" = prompt ] || [ "${pid:-0}" = 0 ]; then
+  pid=$(claude_pid)
+fi
+
+mkdir -p "$dir" || exit 0
+# Write a dotfile first (the watcher's glob skips those), then rename into place.
+write() {  # file state
+  local tmp="$dir/.$sid.$$"
+  printf '%s %s %s %s\n' "$2" "${pid:-0}" "$(date +%s)" "${cwd:-$old_cwd}" > "$tmp" &&
+    mv -f "$tmp" "$1"
+}
+# claude-transit lists sessions by their main file, so a subagent's events
+# create it if the main thread hasn't reported yet (e.g. hooks added mid-session).
+[ -n "$aid" ] && [ ! -f "$main_file" ] && write "$main_file" idle
+write "$file" "$state"
+exit 0

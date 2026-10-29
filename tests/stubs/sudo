@@ -1,0 +1,20 @@
+#!/bin/bash
+# Test stub for sudo: allows exactly the pmset argument lists in $STUB_STATE/sudo_rule.
+S=${STUB_STATE:?STUB_STATE not set}
+while [ $# -gt 0 ]; do
+  case $1 in
+    -k) exit 0 ;;
+    -n) shift ;;
+    --) shift; break ;;
+    -*) echo "sudo stub: unhandled flag $1" >&2; exit 1 ;;
+    *) break ;;
+  esac
+done
+if [ "${1:-}" = /usr/bin/pmset ]; then
+  shift
+  if [ -f "$S/sudo_rule" ] && grep -qxF -- "$*" "$S/sudo_rule"; then
+    STUB_ROOT=1 exec pmset "$@"
+  fi
+fi
+echo "sudo: a password is required" >&2
+exit 1

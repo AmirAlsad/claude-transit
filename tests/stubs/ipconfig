@@ -1,0 +1,10 @@
+#!/bin/bash
+# Test stub for ipconfig: IP from $STUB_STATE/ip (default 10.0.0.5, "none" for
+# no Wi-Fi); SSID from $STUB_STATE/ssid (default "<redacted>", like recent macOS).
+S=${STUB_STATE:?STUB_STATE not set}
+ip=$(cat "$S/ip" 2>/dev/null || echo 10.0.0.5)
+case "$1" in
+  getifaddr) [ "$ip" = none ] && exit 1; echo "$ip" ;;
+  getsummary) printf '<dictionary> {\n  BSSID : aa:bb\n  SSID : %s\n}\n' "$(cat "$S/ssid" 2>/dev/null || echo '<redacted>')" ;;
+  *) exit 1 ;;
+esac

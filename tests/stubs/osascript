@@ -1,0 +1,8 @@
+#!/bin/bash
+# Test stub for osascript: answers the thermal-state query from
+# $STUB_STATE/thermal (default 0 = nominal) and records notifications.
+S=${STUB_STATE:?STUB_STATE not set}
+case "$*" in
+  *thermalState*) cat "$S/thermal" 2>/dev/null || echo 0 ;;
+  *) echo "notify $*" >> "$S/events" ;;
+esac
