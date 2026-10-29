@@ -504,6 +504,15 @@ kill "$fc" 2>/dev/null
 ct off >/dev/null
 
 reset
+set -- $(fake_claude_cmd bg5 ' SECRET_VAR="hunter2" && sleep 603')
+fc=$1
+wait_for 3 [ -f "$SESS/bg5" ]
+hook bg5 stop
+st=$(ct status)
+check "a variable's value is hidden even after a leading space" all '[[ $st == *'"'"'$ SECRET_VAR=… sleep 603'"'"'* && $st != *hunter2* ]]'
+kill "$fc" 2>/dev/null
+
+reset
 set -- $(fake_claude_cmd bg4 "cd $HOME && sleep 602")
 fc=$1
 wait_for 3 [ -f "$SESS/bg4" ]

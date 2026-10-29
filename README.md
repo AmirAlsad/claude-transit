@@ -246,6 +246,16 @@ send is logged (`phone: sent "..."`, or `couldn't send` if the network was
 down). A custom command should finish within a few seconds, because the last
 notification goes out just before the Mac sleeps.
 
+**ntfy can be minutes late on an iPhone.** On iOS, ntfy.sh sends only a
+"fetch message" signal through Apple's push service, and the app has to wake
+up to download the message. iOS can put that off, so a notification sent the
+moment the lid closes may show up a few minutes later. ntfy's "instant
+delivery" setting, which avoids this, exists only on Android. If you need
+alerts on time on an iPhone, rely on Claude's own push, or use a service that
+sends the whole message through Apple's push service (Pushover, or Bark) via
+`CLAUDE_TRANSIT_NOTIFY_CMD`. A longer `--wait` also gives a late notification
+time to be useful.
+
 ## What it logs
 
 ### Network
@@ -404,7 +414,7 @@ the ones that cover the real hardware. Run them once after installing.
 ## Development
 
 ```
-tests/run.sh /bin/bash      # 193 scenario tests against stub pmset/ioreg/sudo (a few minutes)
+tests/run.sh /bin/bash      # 194 scenario tests against stub pmset/ioreg/sudo (a few minutes)
 node tests/hooks.test.js    # settings.json merge tests
 ```
 

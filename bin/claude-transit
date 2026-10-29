@@ -491,6 +491,7 @@ cmd_label() {
       # Inside eval, a single quote shows as q "\"" q "\"" q and a newline as \012.
       gsub(q "\"" q "\"" q, q, s)
       gsub(/\\012/, " ", s)
+      sub(/^[ \t]+/, "", s)
       pre = ""
       while (match(s, /^(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/)) {
         name = substr(s, 1, RLENGTH - 1)
