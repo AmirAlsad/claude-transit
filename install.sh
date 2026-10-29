@@ -183,7 +183,7 @@ remove_login_agent() {
 }
 
 offer_zshrc_check() {
-  if grep -qF -e 'claude-transit check' -e '# added by claude-transit' "$ZSHRC" 2>/dev/null; then
+  if grep -qF -e 'claude-transit check' -e 'claude-transit" check' "$ZSHRC" 2>/dev/null; then
     return 0
   fi
   echo
@@ -202,6 +202,36 @@ offer_zshrc_check() {
   fi
 }
 
+# Phone notifications through ntfy.sh are optional, so pressing Enter skips them.
+offer_phone_setup() {
+  local topic='' example
+  if [ -n "${CLAUDE_TRANSIT_NTFY:-}${CLAUDE_TRANSIT_NOTIFY_CMD:-}" ] ||
+     grep -qE 'CLAUDE_TRANSIT_(NTFY|NOTIFY_CMD)=' "$ZSHRC" 2>/dev/null; then
+    note "phone notifications are already set up"
+    return 0
+  fi
+  example="claude-transit-$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n')"
+  echo
+  echo "Optional: phone notifications when a session waits on you with the lid closed, and when"
+  echo "the Mac goes to sleep. They go through ntfy.sh (free, no account): install the ntfy app"
+  echo "and subscribe to a topic. Anyone who knows a topic's name can read it, so pick one"
+  echo "nobody would guess, such as $example."
+  if [ -t 0 ]; then
+    read -r -p "ntfy topic (or full ntfy URL), or Enter to skip: " topic || true
+  fi
+  case $topic in
+    '')
+      note "skipped. See \"Phone notifications\" in the README to set it up later."
+      return 0 ;;
+    *[!A-Za-z0-9_./:-]*)
+      note "'$topic' has characters a topic can't use; skipped. Set it up later from the README."
+      return 0 ;;
+  esac
+  printf '\nexport CLAUDE_TRANSIT_NTFY=%s  # added by claude-transit\n' "$topic" >> "$ZSHRC"
+  note "added to ~/.zshrc. Subscribe to '$topic' in the ntfy app, open a new terminal,"
+  note "and run: claude-transit notify-test"
+}
+
 remove_zshrc_check() {
   local tmp
   grep -qF '# added by claude-transit' "$ZSHRC" 2>/dev/null || return 0
@@ -209,7 +239,7 @@ remove_zshrc_check() {
   grep -vF '# added by claude-transit' "$ZSHRC" > "$tmp" || true
   cat "$tmp" > "$ZSHRC"
   rm -f "$tmp"
-  note "removed the check line from ~/.zshrc"
+  note "removed claude-transit's lines from ~/.zshrc"
 }
 
 do_install() {
@@ -242,6 +272,7 @@ do_install() {
   esac
 
   offer_zshrc_check
+  offer_phone_setup
 
   echo
   step "Done. Current state:"
@@ -251,8 +282,7 @@ do_install() {
   echo "If 'claude-transit status' doesn't count a session after you send it a prompt,"
   echo "restart that session."
   echo
-  echo "Optional: to get phone notifications when a session waits on you with the lid closed,"
-  echo "see \"Phone notifications\" in the README, then run: claude-transit notify-test"
+  echo "To answer Claude's questions from your phone, see \"Quick start\" in the README."
 }
 
 do_uninstall() {

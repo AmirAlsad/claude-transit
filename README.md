@@ -54,10 +54,38 @@ four changes:
 3. **Claude Code hooks.** Adds nine hook entries to `~/.claude/settings.json`. Your other settings and hooks stay as they are, and the previous file is saved as `settings.json.claude-transit-backup`.
 4. **Login check.** Adds `~/Library/LaunchAgents/com.claude-transit.login-check.plist`. At each login it runs `claude-transit check --fix` once and exits; nothing stays running. macOS may show a "Background Items Added" notice for it.
 
-It also offers to add one line to `~/.zshrc` that warns you if sleep is ever
-left off (see "If something goes wrong").
+It also offers to add two lines to `~/.zshrc`, each marked
+`# added by claude-transit`. One warns you if sleep is ever left off (see "If
+something goes wrong"). The other sets up [phone notifications](#phone-notifications).
+Both are optional.
 
-`./install.sh --uninstall` reverses all of it. It keeps only the log.
+**Updating:** `git pull`, then `./install.sh` again. It replaces the scripts
+and hooks in place and leaves your settings alone.
+
+**Uninstalling:** `./install.sh --uninstall` reverses all of it, including the
+`~/.zshrc` lines it added. It keeps only the log.
+
+## Quick start
+
+1. **Check the install.** `claude-transit status` should say `Hooks: installed`
+   and `Sudo rule: installed`. Then run the [hardware checklist](#full-checklist)
+   once. It takes about 20 minutes and is the only test that touches your real
+   Mac.
+2. **Set up your phone,** so you can answer Claude while the lid is shut:
+   - Install the Claude app ([iOS](https://apps.apple.com/us/app/claude-by-anthropic/id6473753684),
+     [Android](https://play.google.com/store/apps/details?id=com.anthropic.claude))
+     and sign in with the same account as Claude Code.
+   - In Claude Code, run `/config` and turn on **Enable Remote Control for all
+     sessions**, or run `/remote-control` in a session before you leave.
+   - In `/config`, turn on **Push when actions required**.
+   - Optional: [claude-transit's own notifications](#phone-notifications), as a
+     backstop and to hear when the Mac goes to sleep.
+3. **On a trip:** start the task, join your hotspot, run `claude-transit`, and
+   close the lid. If your phone says Claude is waiting on you, answer in the
+   Claude app. Open the lid when you arrive.
+4. **Make it yours.** Every timing and the notification setup can be changed;
+   see [Configuration](#configuration).
+
 
 ## When sleep comes back
 
@@ -144,7 +172,22 @@ Each report also records the Claude Code process ID. If that process dies
 mid-turn (for example, you closed its terminal), its "working" report is
 ignored rather than keeping the Mac awake.
 
-### Waiting on you
+**Why hooks instead of CPU usage:** the earlier plan inferred "working" from
+the CPU use of processes named `claude`. That reads a long model turn as idle,
+because the process is just waiting on the network. It also misses builds and
+tests, because those run as `xcodebuild`, `swift`, `npm` and so on. Hooks
+report the event itself, so no threshold needs tuning.
+
+**Why a 30s grace period:** a turn can end and pick up again straight away,
+for example when a background task finishes. The grace period lets those
+restarts cancel the countdown. Change it with `CLAUDE_TRANSIT_GRACE=60 claude-transit`.
+
+**Why "sleep now":** switching `disablesleep` back to 0 with the lid already
+closed may not put the Mac to sleep by itself. It could otherwise sit awake in
+your bag until the idle timer runs out, so after B, H or C the watcher also runs
+`pmset sleepnow`.
+
+## Waiting on you
 
 A session stopped at a permission prompt or a question can't move until
 someone answers. With Remote Control, that someone can be you, on your phone.
@@ -167,43 +210,43 @@ session reads "waiting" until the approved tool finishes. A shell command
 counts as running while it runs, so that's covered. A long tool that isn't a
 shell command (a web fetch, an MCP call) is covered only until the hold ends.
 
-### Phone notifications
+## Phone notifications
 
-The hold only helps if you know a question came in. Claude Code can push to
-the Claude app itself (turn it on in `/config`), and that's the first thing
-to set up. claude-transit can also send its own notifications, which help if
-Claude's push doesn't arrive, and it's the only thing that can tell you the
-Mac is going to sleep. With the lid closed, it sends one when:
+The hold only helps if you know a question came in. There are two sources of
+notifications, and they work well together.
+
+**Claude's own push** (set this up first). In Claude Code, run `/config` and
+turn on **Push when actions required**. The Claude app then tells you about
+permission prompts and questions in Remote Control sessions.
+
+**claude-transit's notifications** are a backstop in case Claude's push
+doesn't arrive, and they're the only way to hear that the Mac is going to
+sleep. With the lid closed, claude-transit sends one when:
 
 - a session starts waiting on you (high priority, with the minutes left), and
 - it puts the Mac to sleep (Claude finished, no answer came, time ran out, or heat).
 
-Nothing is sent while the lid is open, since you're at the Mac. Two ways to set
-it up, in `~/.zshrc`:
+Nothing is sent while the lid is open, since you're at the Mac. `install.sh`
+offers to set up ntfy for you. To do it by hand, add one of these to
+`~/.zshrc`:
 
 ```
-# ntfy.sh: install the ntfy app, subscribe to a topic name nobody would guess
-export CLAUDE_TRANSIT_NTFY=transit-k3v9q2x7       # or a full URL to your own ntfy server
+# ntfy.sh (free, no account): install the ntfy app and subscribe to the same topic
+export CLAUDE_TRANSIT_NTFY=claude-transit-k3v9q2x7   # or a full URL to your own ntfy server
 
-# or any command; it gets the title as $1 and the message as $2
-export CLAUDE_TRANSIT_NOTIFY_CMD='my-notifier "$1" "$2"'
+# or any command; it gets the title as $1 and the message as $2. For example, Pushover:
+export CLAUDE_TRANSIT_NOTIFY_CMD='curl -s -F token=YOUR_APP_TOKEN -F user=YOUR_USER_KEY -F title="$1" -F message="$2" https://api.pushover.net/1/messages.json'
 ```
 
 Then open a new terminal and run `claude-transit notify-test`. Tapping an ntfy
-notification opens claude.ai/code, where your Remote Control sessions are listed.
-Messages name only the project folder. Anyone who knows an ntfy.sh topic
-name can read it, so pick one nobody would guess. Each send is logged
-(`phone: sent "..."`, or `couldn't send` if the network was down).
+notification opens claude.ai/code, where your Remote Control sessions are
+listed. Messages name only the project folder. Anyone who knows an ntfy.sh
+topic name can read it and send to it, so pick one nobody would guess. Each
+send is logged (`phone: sent "..."`, or `couldn't send` if the network was
+down). A custom command should finish within a few seconds, because the last
+notification goes out just before the Mac sleeps.
 
-**Why hooks instead of CPU usage:** the earlier plan inferred "working" from
-the CPU use of processes named `claude`. That reads a long model turn as idle,
-because the process is just waiting on the network. It also misses builds and
-tests, because those run as `xcodebuild`, `swift`, `npm` and so on. Hooks
-report the event itself, so no threshold needs tuning.
-
-**Why a 30s grace period:** a turn can end and pick up again straight away,
-for example when a background task finishes. The grace period lets those
-restarts cancel the countdown. Change it with `CLAUDE_TRANSIT_GRACE=60 claude-transit`.
+## What it logs
 
 ### Network
 
@@ -258,10 +301,27 @@ been armed:
 
 To see how a trip went: `grep -E 'ARMED|heat|DISARMED' ~/Library/Logs/claude-transit.log`.
 
-**Why "sleep now":** switching `disablesleep` back to 0 with the lid already
-closed may not put the Mac to sleep by itself. It could otherwise sit awake in
-your bag until the idle timer runs out, so after B, H or C the watcher also runs
-`pmset sleepnow`.
+## Configuration
+
+Settings are environment variables, read each time you arm. Put the ones you
+want in `~/.zshrc` (or `~/.bash_profile` if you use bash), then open a new
+terminal. One-offs work too: `CLAUDE_TRANSIT_GRACE=60 claude-transit`.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `CLAUDE_TRANSIT_WAIT` | `10` | Minutes a session waiting on you keeps the Mac awake. `0` turns the hold off. `--wait` overrides it for one trip. |
+| `CLAUDE_TRANSIT_NTFY` | off | ntfy.sh topic, or a full ntfy URL, for [phone notifications](#phone-notifications). |
+| `CLAUDE_TRANSIT_NOTIFY_CMD` | off | Command for phone notifications; gets the title as `$1` and the message as `$2`. |
+| `CLAUDE_TRANSIT_GRACE` | `30` | Seconds with nothing working, lid closed, before the Mac sleeps (trigger B). |
+| `CLAUDE_TRANSIT_AGENT_QUIET` | `600` | Seconds a subagent can go without a hook event before it stops counting as working. |
+| `CLAUDE_TRANSIT_CMD_MARKER` | `/.claude/shell-snapshots/` | Text that marks a shell command Claude started. Change it only if a Claude Code update breaks command detection. |
+| `CLAUDE_TRANSIT_INTERVAL` | `3` | Seconds between checks while armed. |
+| `CLAUDE_TRANSIT_HEAT_EVERY`, `CLAUDE_TRANSIT_NET_EVERY` | `15` | Seconds between heat readings, and between network checks. |
+| `CLAUDE_TRANSIT_LOG` | `~/Library/Logs/claude-transit.log` | Where the log goes. |
+
+The trip length is an argument, not a setting: `claude-transit 45` arms for 45
+minutes (1 to 240). To change your default, use an alias, such as
+`alias transit='claude-transit 45 --wait 15'`.
 
 ## Things to know
 
@@ -339,6 +399,7 @@ the ones that cover the real hardware. Run them once after installing.
 | `~/Library/Logs/claude-transit.log` | the log (also visible in Console.app) |
 | `/etc/sudoers.d/claude-transit` | the sudoers rule |
 | `~/Library/LaunchAgents/com.claude-transit.login-check.plist` | the login check |
+| `~/.zshrc` | optional lines marked `# added by claude-transit` |
 
 ## Development
 
@@ -347,5 +408,7 @@ tests/run.sh /bin/bash      # 193 scenario tests against stub pmset/ioreg/sudo (
 node tests/hooks.test.js    # settings.json merge tests
 ```
 
-The scripts target the bash 3.2 that ships with macOS. The scenario tests pass
-under both Apple's bash 3.2.57 and bash 5.
+The scripts target the bash 3.2 that ships with macOS, so avoid bash 4+
+features. The scenario tests run against stand-ins in `tests/stubs`, so they
+never touch your real power settings. Last full run: Apple's bash 3.2.57. Issues
+and pull requests are welcome; please run both test suites first.
